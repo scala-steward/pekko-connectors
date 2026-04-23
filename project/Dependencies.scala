@@ -27,7 +27,7 @@ object Dependencies {
 
   val AvroVersion = "1.12.1"
 
-  val AwsSdk2Version = "2.42.37"
+  val AwsSdk2Version = "2.42.39"
 
   val NettyVersion = "4.2.12.Final"
 
