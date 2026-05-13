@@ -18,26 +18,30 @@
 package org.apache.pekko.stream.connectors.googlecloud.pubsub.grpc
 
 import org.apache.pekko
-import pekko.Done
+import pekko.{ Done, NotUsed }
 import pekko.actor.ActorSystem
-import pekko.stream.scaladsl.{ Sink, Source }
+import pekko.stream.scaladsl.{ Keep, Sink, Source }
 import pekko.stream.connectors.googlecloud.pubsub.grpc.scaladsl.{ GooglePubSub, GrpcSubscriber, PubSubAttributes }
 import com.google.protobuf.ByteString
 import com.google.pubsub.v1.pubsub._
+import org.apache.pekko.stream._
 
+import java.util.concurrent.ConcurrentLinkedQueue
 import scala.concurrent.{ Future, Promise }
 import scala.concurrent.duration._
-
+import scala.jdk.CollectionConverters._
 import org.scalatest.BeforeAndAfterAll
-import org.scalatest.concurrent.ScalaFutures
+import org.scalatest.concurrent.{ Eventually, ScalaFutures }
 import org.scalatest.matchers.should.Matchers
+import org.scalatest.time.{ Millis, Seconds, Span }
 import org.scalatest.wordspec.AnyWordSpec
 
 class AutoExtendAckDeadlinesSpec
     extends AnyWordSpec
     with Matchers
     with BeforeAndAfterAll
-    with ScalaFutures {
+    with ScalaFutures
+    with Eventually {
 
   implicit val system: ActorSystem = ActorSystem("AutoExtendAckDeadlinesSpec")
   implicit val patience: PatienceConfig = PatienceConfig(10.seconds, 100.millis)
@@ -156,8 +160,83 @@ class AutoExtendAckDeadlinesSpec
     }
   }
 
+  "GooglePubSub.subscribe" should {
+    "send only allowed fields on subsequent StreamingPullRequest messages" in {
+      // Regression test: the keepalive tick must NOT echo initial-only fields
+      // (clientId, maxOutstandingMessages, maxOutstandingBytes) back to the server,
+      // which would otherwise return INVALID_ARGUMENT on the first tick.
+      val captured = new ConcurrentLinkedQueue[StreamingPullRequest]()
+      val testSubscriber = new GrpcSubscriber(new CapturingStreamingPullClient(captured)(system))
+
+      val initial = StreamingPullRequest()
+        .withSubscription(subscription)
+        .withStreamAckDeadlineSeconds(60)
+        .withClientId("test-client")
+        .withMaxOutstandingMessages(100L)
+        .withMaxOutstandingBytes(10485760L)
+
+      val cancellableFut = GooglePubSub
+        .subscribe(initial, 100.millis)
+        .withAttributes(PubSubAttributes.subscriber(testSubscriber))
+        .toMat(Sink.ignore)(Keep.left)
+        .run()
+
+      // Wait until the initial request plus at least 2 keepalive ticks have landed,
+      // then cancel.
+      eventually(timeout(Span(5, Seconds)), interval(Span(50, Millis))) {
+        captured.size should be >= 3
+      }
+      cancellableFut.futureValue.cancel()
+
+      val first = captured.poll()
+      first should not be null
+      withClue("initial request must carry caller-supplied fields verbatim: ") {
+        first.subscription shouldBe subscription
+        first.streamAckDeadlineSeconds shouldBe 60
+        first.clientId shouldBe "test-client"
+        first.maxOutstandingMessages shouldBe 100L
+        first.maxOutstandingBytes shouldBe 10485760L
+      }
+
+      val subsequent = Iterator
+        .continually(Option(captured.poll()))
+        .takeWhile(_.isDefined)
+        .flatten
+        .toList
+      subsequent should not be empty
+      subsequent.zipWithIndex.foreach { case (req, idx) =>
+        withClue(s"subsequent request #${idx + 1} must be the default instance: ") {
+          req.subscription shouldBe ""
+          req.streamAckDeadlineSeconds shouldBe 0
+          req.clientId shouldBe ""
+          req.maxOutstandingMessages shouldBe 0L
+          req.maxOutstandingBytes shouldBe 0L
+        }
+      }
+    }
+  }
+
   override def afterAll(): Unit =
     system.terminate()
+}
+
+/**
+ * Stub that captures every StreamingPullRequest sent on the client → server stream
+ * and keeps the response stream open indefinitely (so the polling tick keeps firing).
+ */
+class CapturingStreamingPullClient(captured: ConcurrentLinkedQueue[StreamingPullRequest])(
+    implicit sys: ActorSystem) extends TestSubscriberClientBase {
+  private implicit val mat: Materializer = Materializer.matFromSystem(sys)
+
+  override def streamingPull(
+      in: Source[StreamingPullRequest, NotUsed])
+      : Source[StreamingPullResponse, NotUsed] =
+    Source
+      .maybe[StreamingPullResponse]
+      .mapMaterializedValue { _ =>
+        in.runForeach(req => captured.add(req))
+        NotUsed
+      }
 }
 
 /**
@@ -165,8 +244,6 @@ class AutoExtendAckDeadlinesSpec
  * for all methods. Tests override only the methods they need.
  */
 trait TestSubscriberClientBase extends SubscriberClient {
-  import pekko.NotUsed
-
   override def createSubscription(in: Subscription): Future[Subscription] = ???
   override def getSubscription(in: GetSubscriptionRequest): Future[Subscription] = ???
   override def updateSubscription(in: UpdateSubscriptionRequest): Future[Subscription] = ???
@@ -176,8 +253,8 @@ trait TestSubscriberClientBase extends SubscriberClient {
   override def acknowledge(in: AcknowledgeRequest): Future[com.google.protobuf.empty.Empty] = ???
   override def pull(in: PullRequest): Future[PullResponse] = ???
   override def streamingPull(
-      in: pekko.stream.scaladsl.Source[StreamingPullRequest, NotUsed])
-      : pekko.stream.scaladsl.Source[StreamingPullResponse, NotUsed] = ???
+      in: Source[StreamingPullRequest, NotUsed])
+      : Source[StreamingPullResponse, NotUsed] = ???
   override def modifyPushConfig(in: ModifyPushConfigRequest): Future[com.google.protobuf.empty.Empty] = ???
   override def getSnapshot(in: GetSnapshotRequest): Future[Snapshot] = ???
   override def listSnapshots(in: ListSnapshotsRequest): Future[ListSnapshotsResponse] = ???
